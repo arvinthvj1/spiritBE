@@ -447,6 +447,15 @@ app.post('/api/upload-image', uploadMiddleware, async (req, res) => {
     const imageDescription = visionResponse.output_text;
     console.log('Image description from GPT-4o mini:', imageDescription);
 
+    // Check if the vision model was unable to analyze the image properly
+    if (imageDescription.startsWith('I\'m unable to analyze the image in detail as requested')) {
+      console.log('Vision model unable to analyze image properly');
+      return res.status(400).json({
+        error: 'Our AI system could not properly analyze your image. Please try a different image with clearer content.',
+        details: 'Vision model unable to process image details'
+      });
+    }
+
     // Create a very specific prompt for DALL-E 3 focused on Studio Ghibli style
     let finalPrompt = "";
 
@@ -456,12 +465,15 @@ app.post('/api/upload-image', uploadMiddleware, async (req, res) => {
     // Add the image description from GPT-4o mini
     if (imageDescription) {
       // Extract the first 3-4 sentences for key content
-      const sentences = imageDescription.split('.')
-        .filter(s => s.trim().length > 0)
-        .slice(0, 4)
-        .map(s => s.trim() + '.');
+      const sentences = imageDescription
+      // .split('.')
+      //   .filter(s => s.trim().length > 0)
+      //   .slice(0, 4)
+      //   .map(s => s.trim() + '.');
 
-      finalPrompt += `The image shows: ${sentences.join(' ')} `;
+      finalPrompt += `The image shows: ${sentences
+        // .join(' ')
+      } `;
     }
 
     // Add the specific Studio Ghibli style instruction
@@ -481,7 +493,7 @@ app.post('/api/upload-image', uploadMiddleware, async (req, res) => {
     // finalPrompt += `4) Emphasis on natural elements — detailed skies, wind-blown grass, trees, water reflections, and ambient light, `;
     // finalPrompt += `5) Whimsical, peaceful atmosphere with a sense of magic or quiet wonder, similar to films like 'My Neighbor Totoro' or 'Spirited Away'. `;
     // finalPrompt += `This must look like an actual animation frame captured from a Studio Ghibli film, complete with cinematic depth and painterly texture.`;
-    
+
 
     // Truncate if needed
     const MAX_PROMPT_LENGTH = 950;
