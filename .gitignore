@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/bower_components/
+# Testing
+coverage/test/
+.nyc_output/reports/
+# Build/Distribution
+dist/build/
+# Documentation
+docs/examples/
+# IDE and Editor files
+.sass-cache/.vscode/
+.idea/
+# Logslogs/
+*.log
+# Environment and config.env
+.env.*.npmrc
+# OS generated files
+.DS_Store.DS_Store?
+._*.Spotlight-V100
+.Trashesehthumbs.db
+Thumbs.db
+# Misc*.lock
+package-lock.json
+.git/
+
+node_modules/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
