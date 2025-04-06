@@ -6,28 +6,15 @@ const crypto = require('crypto');
 const { OpenAI } = require('openai');
 const firebase = require('./firebase');
 const multer = require('multer');
-const path = require('path');
 const fs = require('fs');
+const path = require('path');
 const sharp = require('sharp');
 
-// Set up multer for file uploads
-const storage = multer.diskStorage({
-  destination: function (_req, _file, cb) {
-    const uploadDir = path.join(__dirname, 'uploads');
-    // Create the directory if it doesn't exist
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    cb(null, uploadDir);
-  },
-  filename: function (_req, file, cb) {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, uniqueSuffix + path.extname(file.originalname));
-  }
-});
+// Set up multer for file uploads using memory storage instead of disk storage
+// This keeps files in memory and doesn't save them to disk
 
 const upload = multer({
-  storage: storage,
+  storage: multer.memoryStorage(), // Use memory storage instead of disk storage
   limits: { fileSize: 4 * 1024 * 1024 }, // 4MB limit
   fileFilter: function (_req, file, cb) {
     console.log('Multer fileFilter called with file:', file.originalname, file.mimetype);
@@ -87,7 +74,15 @@ console.log('OpenAI client initialized');
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// Serve static files from the uploads directory
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// Create uploads directory if it doesn't exist
+const uploadDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
 
 // Routes
 app.get('/', (_req, res) => {
@@ -267,10 +262,10 @@ app.post('/api/upload-image', uploadMiddleware, async (req, res) => {
   console.log('Request file:', req.file ? 'File present' : 'No file');
   if (req.file) {
     console.log('File details:', {
-      filename: req.file.filename,
       originalname: req.file.originalname,
       mimetype: req.file.mimetype,
-      size: req.file.size
+      size: req.file.buffer ? req.file.buffer.length : 0,
+      inMemory: true
     });
   }
   try {
@@ -285,18 +280,12 @@ app.post('/api/upload-image', uploadMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'No image file was uploaded. Please select an image to transform.' });
     }
 
-    console.log('File successfully uploaded and available at:', req.file.path);
+    console.log('File successfully uploaded to memory');
 
-    // Check if the file exists and has content
-    try {
-      const stats = fs.statSync(req.file.path);
-      if (stats.size === 0) {
-        console.error('Uploaded file is empty');
-        return res.status(400).json({ error: 'The uploaded file is empty. Please select a valid image.' });
-      }
-    } catch (err) {
-      console.error('Error checking uploaded file:', err);
-      return res.status(400).json({ error: 'There was an issue with the uploaded file. Please try again.' });
+    // Check if the file buffer has content
+    if (!req.file.buffer || req.file.buffer.length === 0) {
+      console.error('Uploaded file buffer is empty');
+      return res.status(400).json({ error: 'The uploaded file is empty. Please select a valid image.' });
     }
 
     // Get user from Firebase
@@ -311,25 +300,49 @@ app.post('/api/upload-image', uploadMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Not enough credits' });
     }
 
-    // Get the uploaded file path
-    const uploadedFilePath = req.file.path;
-    const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${path.basename(uploadedFilePath)}`;
+    // Generate a unique ID for this image processing request
+    const imageId = Date.now() + '-' + Math.round(Math.random() * 1E9);
 
-    // Convert the image to PNG format and optimize it for DALL-E
-    const pngFilePath = path.join(path.dirname(uploadedFilePath), `${path.parse(uploadedFilePath).name}.png`);
+    // Create temporary file paths for the frontend to access
+    const tempFilePath = path.join(uploadDir, `${imageId}-original${path.extname(req.file.originalname)}`);
+    const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${path.basename(tempFilePath)}`;
+
+    // Declare processedImageBuffer at the outer scope so it's accessible throughout the function
+    // Initialize with the original buffer as a fallback
+    let processedImageBuffer = req.file.buffer;
+
+    // Save the original file to disk for the frontend to access
+    fs.writeFileSync(tempFilePath, req.file.buffer);
+    console.log(`Saved original file to disk for frontend access: ${tempFilePath}`);
+
+    // Create a function to clean up temporary files after response is sent
+    const cleanupTempFiles = () => {
+      // Use setTimeout to delay cleanup to ensure frontend has time to load the image
+      setTimeout(() => {
+        try {
+          if (fs.existsSync(tempFilePath)) {
+            fs.unlinkSync(tempFilePath);
+            console.log(`Cleaned up temporary file: ${tempFilePath}`);
+          }
+        } catch (cleanupError) {
+          console.error('Error cleaning up temporary file:', cleanupError);
+        }
+      }, 60000); // 60 seconds delay to ensure frontend has loaded the image
+    };
 
     try {
+
       try {
-        // Process the image with sharp to convert to PNG with alpha channel (RGBA) and resize if needed
-        await sharp(uploadedFilePath, { failOnError: false })
+        // Process the image buffer with sharp
+        processedImageBuffer = await sharp(req.file.buffer, { failOnError: false })
           .resize({ width: 1024, height: 1024, fit: 'inside', withoutEnlargement: true })
           .toColorspace('srgb') // Use standard RGB colorspace
           .ensureAlpha() // Ensure the image has an alpha channel (RGBA)
           .png({ quality: 90, force: true }) // Force PNG output
-          .toFile(pngFilePath);
+          .toBuffer();
 
         // Log the image format for debugging
-        const metadata = await sharp(pngFilePath).metadata();
+        const metadata = await sharp(processedImageBuffer).metadata();
         console.log('Image format details:', {
           format: metadata.format,
           channels: metadata.channels,
@@ -341,30 +354,30 @@ app.post('/api/upload-image', uploadMiddleware, async (req, res) => {
       } catch (sharpError) {
         console.error('Error processing image with Sharp:', sharpError);
 
-        // Fallback: Just copy the file if Sharp processing fails
-        console.log('Using fallback: copying original file');
-        fs.copyFileSync(uploadedFilePath, pngFilePath);
+        // Fallback: Just use the original buffer if Sharp processing fails
+        console.log('Using fallback: using original buffer');
+        processedImageBuffer = req.file.buffer;
       }
 
-      console.log(`Image converted to PNG: ${pngFilePath}`);
+      console.log('Image processed in memory');
 
-      // Check file size
-      const stats = fs.statSync(pngFilePath);
-      const fileSizeInMB = stats.size / (1024 * 1024);
-      console.log(`PNG file size: ${fileSizeInMB.toFixed(2)} MB`);
+      // Check buffer size
+      const bufferSizeInMB = processedImageBuffer.length / (1024 * 1024);
+      console.log(`Processed image buffer size: ${bufferSizeInMB.toFixed(2)} MB`);
 
-      if (fileSizeInMB > 3.9) {
+      // If the buffer is too large, compress it further
+      if (bufferSizeInMB > 3.9) {
         try {
-          // If still too large, compress further
-          await sharp(pngFilePath, { failOnError: false })
+          // Compress the image further
+          processedImageBuffer = await sharp(processedImageBuffer, { failOnError: false })
             .resize({ width: 800, height: 800, fit: 'inside' })
             .toColorspace('srgb') // Use standard RGB colorspace
             .ensureAlpha() // Ensure the image has an alpha channel (RGBA)
-            .png({ quality: 80, compressionLevel: 9, force: true }) // Force PNG output
-            .toFile(pngFilePath + '.compressed.png');
+            .png({ quality: 80, compressionLevel: 9, force: true }) // Force PNG output with high compression
+            .toBuffer();
 
           // Log the compressed image format for debugging
-          const compressedMetadata = await sharp(pngFilePath + '.compressed.png').metadata();
+          const compressedMetadata = await sharp(processedImageBuffer).metadata();
           console.log('Compressed image format details:', {
             format: compressedMetadata.format,
             channels: compressedMetadata.channels,
@@ -374,17 +387,12 @@ app.post('/api/upload-image', uploadMiddleware, async (req, res) => {
             height: compressedMetadata.height
           });
 
-          // Replace the original file with the compressed one
-          fs.unlinkSync(pngFilePath);
-          fs.renameSync(pngFilePath + '.compressed.png', pngFilePath);
-
-          const newStats = fs.statSync(pngFilePath);
-          console.log(`Compressed PNG file size: ${(newStats.size / (1024 * 1024)).toFixed(2)} MB`);
+          const compressedSizeInMB = processedImageBuffer.length / (1024 * 1024);
+          console.log(`Compressed image buffer size: ${compressedSizeInMB.toFixed(2)} MB`);
         } catch (compressionError) {
           console.error('Error compressing image with Sharp:', compressionError);
           console.log('Skipping compression due to error');
-
-          // If the file is too large and compression fails, we'll still try to use it
+          // We'll still try to use the uncompressed buffer
           // DALL-E might reject it, but we'll let the API handle that error
         }
       }
@@ -393,18 +401,24 @@ app.post('/api/upload-image', uploadMiddleware, async (req, res) => {
       console.error('Error details:', err.message);
       console.error('Error stack:', err.stack);
 
-      // Send a more detailed error message to help with debugging
-      return res.status(400).json({
-        error: 'Failed to process the uploaded image. Please try a different image.',
-        details: process.env.NODE_ENV === 'development' ? err.message : undefined,
-        fileInfo: req.file ? {
-          filename: req.file.filename,
-          originalname: req.file.originalname,
-          mimetype: req.file.mimetype,
-          size: req.file.size,
-          path: req.file.path
-        } : 'No file info available'
-      });
+      // If we have a critical error that prevents us from continuing, return an error response
+      // Otherwise, we'll continue with the original buffer
+      if (!processedImageBuffer) {
+        return res.status(400).json({
+          error: 'Failed to process the uploaded image. Please try a different image.',
+          details: process.env.NODE_ENV === 'development' ? err.message : undefined,
+          fileInfo: req.file ? {
+            originalname: req.file.originalname,
+            mimetype: req.file.mimetype,
+            size: req.file.size,
+            inMemory: true
+          } : 'No file info available'
+        });
+      }
+
+      // If we have a processedImageBuffer (either from successful processing or fallback),
+      // we can continue with the process
+      console.log('Continuing with available image buffer despite processing error');
     }
 
     // Get user prompt or use default
@@ -418,9 +432,13 @@ app.post('/api/upload-image', uploadMiddleware, async (req, res) => {
       'ghibli-fantasy': 'Create a Studio Ghibli artwork in Hayao Miyazaki\'s distinctive style showing the exact same scene with magical elements, whimsical creatures, and ethereal lighting like in "Spirited Away" or "Howl\'s Moving Castle"'
     };
 
-    // Create a base64 encoding of the image for GPT-4 Vision
-    const imageBuffer = fs.readFileSync(pngFilePath);
-    const base64Image = imageBuffer.toString('base64');
+    // Create a base64 encoding of the processed image buffer for GPT-4 Vision
+    // Make sure processedImageBuffer is defined, fallback to original buffer if not
+    if (!processedImageBuffer) {
+      console.log('Warning: processedImageBuffer is undefined, using original buffer');
+      processedImageBuffer = req.file.buffer;
+    }
+    const base64Image = processedImageBuffer.toString('base64');
 
     console.log('Using GPT-4o mini with vision capabilities to analyze the uploaded image...');
 
@@ -432,7 +450,7 @@ app.post('/api/upload-image', uploadMiddleware, async (req, res) => {
         content: [
           {
             type: "input_text",
-            text: "Analyze this image in extreme detail. List EXACTLY what is in the image - all objects, people, people's ages, hair types, scenery, colors, lighting, and composition. Be extremely specific about what is physically present in the image. This is critical for accurate image transformation."
+            text: `Analyze this image in extreme detail, as if it were a frame from a Studio Ghibli film. Imagine you are a master at describing visual scenes, meticulously noting every element to craft the perfect prompt for DALL·E 3. Your goal is to enable the accurate recreation of this image in Miyazaki’s signature Ghibli style.`
           },
           {
             type: "input_image",
@@ -450,10 +468,16 @@ app.post('/api/upload-image', uploadMiddleware, async (req, res) => {
     // Check if the vision model was unable to analyze the image properly
     if (imageDescription.startsWith('I\'m unable to analyze the image in detail as requested')) {
       console.log('Vision model unable to analyze image properly');
-      return res.status(400).json({
+
+      // Return error response
+      res.status(400).json({
         error: 'Our AI system could not properly analyze your image. Please try a different image with clearer content.',
         details: 'Vision model unable to process image details'
       });
+
+      // Clean up temporary files after response is sent
+      cleanupTempFiles();
+      return;
     }
 
     // Create a very specific prompt for DALL-E 3 focused on Studio Ghibli style
@@ -528,17 +552,21 @@ app.post('/api/upload-image', uploadMiddleware, async (req, res) => {
 
       // Check if this is a file format error
       if (openaiError.message && openaiError.message.includes('Invalid input image')) {
-        return res.status(400).json({
+        res.status(400).json({
           error: 'The image format is not compatible with our AI system. Please try a different image.',
           details: openaiError.message
         });
+      } else {
+        // For other OpenAI errors
+        res.status(500).json({
+          error: 'Error generating image with AI. Please try again or use a different image.',
+          details: process.env.NODE_ENV === 'development' ? openaiError.message : undefined
+        });
       }
 
-      // For other OpenAI errors
-      return res.status(500).json({
-        error: 'Error generating image with AI. Please try again or use a different image.',
-        details: process.env.NODE_ENV === 'development' ? openaiError.message : undefined
-      });
+      // Clean up temporary files after response is sent
+      cleanupTempFiles();
+      return;
     }
 
     // No mask files to clean up with DALL-E 3
@@ -546,15 +574,22 @@ app.post('/api/upload-image', uploadMiddleware, async (req, res) => {
     // Check if we have a valid response
     if (!response || !response.data || !response.data[0] || !response.data[0].url) {
       console.error('Invalid response from OpenAI:', response);
-      return res.status(500).json({
+
+      res.status(500).json({
         error: 'Failed to generate image. The AI service returned an invalid response.',
         details: process.env.NODE_ENV === 'development' ? 'Missing image URL in response' : undefined
       });
+
+      // Clean up temporary files after response is sent
+      cleanupTempFiles();
+      return;
     }
 
     // Get the image URL from the response
     const imageUrl = response.data[0].url;
     console.log('Image URL received from OpenAI');
+
+    // No files to clean up since we're using memory storage
 
     // Deduct 1 credit from the user's account
     const updatedCredits = await firebase.updateUserCredits(userId, -1);
@@ -590,8 +625,14 @@ app.post('/api/upload-image', uploadMiddleware, async (req, res) => {
       enhancedPrompt: finalPrompt,
       imageDescription: imageDescription
     });
+
+    // Clean up temporary files after response is sent
+    cleanupTempFiles();
   } catch (error) {
     console.error('Error transforming image:', error);
+
+    // Clean up temporary files after response is sent
+    cleanupTempFiles();
 
     // Determine the appropriate status code and error message
     let statusCode = 500;
